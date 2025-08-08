@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import traceback
 import os
 from werkzeug.utils import secure_filename
+from flask import send_from_directory
 
 # --- App Initialization and Configuration ---
 app = Flask(__name__)
@@ -90,7 +91,7 @@ class LSTMPredictor:
             
             # --- Pivot the data to create a time-series format ---
             df_pivot = relevant_characteristics.pivot_table(
-                index=['StrokeNumber', 'MachineName'], 
+                index=['StrokeNumber', 'MachineName', 'StrokeStartTime'],
                 columns='MappedCharacteristic', 
                 values='AvgValue', 
                 aggfunc='first'
@@ -104,7 +105,7 @@ class LSTMPredictor:
                 print("No feature columns found in pivoted data!")
                 return None, None
             
-            df_selected = df_pivot[['StrokeNumber', 'MachineName'] + self.feature_columns].dropna()
+            df_selected = df_pivot[['StrokeStartTime', 'StrokeNumber', 'MachineName'] + self.feature_columns].dropna()
             
             if df_selected.empty:
                 print("No data remaining after removing NaN values!")
@@ -174,6 +175,10 @@ class LSTMPredictor:
             return None, "Model has not been trained yet. Please upload a file and train the model."
         
         try:
+            # Ensure there's enough data for the initial sequence
+            if len(self.scaled_data) < self.seq_len:
+                return None, "Not enough historical data to make a prediction."
+
             input_seq = self.scaled_data[-self.seq_len:].reshape(1, self.seq_len, len(self.feature_columns))
             future_predictions = []
             
@@ -185,6 +190,7 @@ class LSTMPredictor:
             future_predictions = self.scaler.inverse_transform(np.array(future_predictions))
             
             now = datetime.now()
+            # Each step is a 5-minute interval
             timestamps = [(now + timedelta(minutes=i * 5)).strftime("%H:%M") for i in range(steps)]
             
             return future_predictions, timestamps
@@ -209,6 +215,7 @@ class LSTMPredictor:
             thresholds = {
                 'metal_temperature': {'min': 675, 'max': 755},
                 'top_die_temperature': {'min': 270, 'max': 370},
+                'solidification_time': {'min': 150, 'max': 200}
             }
 
             for machine in machines:
@@ -219,7 +226,6 @@ class LSTMPredictor:
                 temp_violations = 0
                 for param, limits in thresholds.items():
                     if param in machine_data_pivoted.columns:
-                        # Count rows where the value is outside the min/max range
                         violations = machine_data_pivoted[
                             (machine_data_pivoted[param] < limits['min']) | 
                             (machine_data_pivoted[param] > limits['max'])
@@ -242,7 +248,7 @@ class LSTMPredictor:
 
                 metrics[machine] = {
                     "idle_time_violations": int(idle_violations),
-                    "temperature_violations": int(temp_violations),  # Add the new metric
+                    "temperature_violations": int(temp_violations),
                     "total_strokes": int(total_strokes),
                     "machine_utilization": round(utilization, 2) if pd.notna(utilization) else 0
                 }
@@ -271,9 +277,9 @@ def upload_file():
     """Handles file uploads from the frontend."""
     if 'file' not in request.files:
         return jsonify({"success": False, "message": "No file part in the request"}), 400
-    
+
     file = request.files['file']
-    
+
     if file.filename == '':
         return jsonify({"success": False, "message": "No file selected"}), 400
         
@@ -284,7 +290,7 @@ def upload_file():
             file.save(filepath)
             
             predictor.current_data_file = filepath
-            predictor.trained = False
+            predictor.trained = False 
 
             response_data = {
                 "success": True,
@@ -312,25 +318,82 @@ def train_model_endpoint():
         return jsonify({"success": False, "message": message}), 400
     return jsonify({"success": True, "message": message, "feature_columns": predictor.feature_columns})
 
-@app.route('/api/predict', methods=['GET'])
-def get_predictions():
-    """Returns future predictions based on the trained model."""
-    steps = request.args.get('steps', 20, type=int)
+@app.route('/api/chart_data', methods=['GET'])
+def get_chart_data():
+    """
+    Provides historical and predicted data for the main chart.
+    Accepts 'machine', 'parameter', and 'range' query parameters.
+    """
+    machine_name = request.args.get('machine', type=str)
+    time_range = request.args.get('range', '24hr', type=str).lower()
+    parameter = request.args.get('parameter', type=str)
+
+    if not machine_name or not parameter:
+        return jsonify({"success": False, "message": "Machine and parameter are required."}), 400
+    
+    if not predictor.trained:
+        return jsonify({"success": False, "message": "Model is not trained. Please upload data or train the model."}), 400
+
+    df_selected, _ = predictor.load_and_preprocess_data()
+    if df_selected is None:
+        return jsonify({"success": False, "message": "Could not load data."}), 400
+
+    machine_data = df_selected[df_selected["MachineName"] == machine_name].copy()
+    if machine_data.empty:
+        return jsonify({"success": True, "data": [], "feature_columns": predictor.feature_columns})
+        
+    machine_data = machine_data.sort_values(by='StrokeStartTime')
+
+    range_deltas = {
+        '1hr': timedelta(hours=1),
+        '6hr': timedelta(hours=6),
+        '24hr': timedelta(hours=24)
+    }
+    time_delta = range_deltas.get(time_range, timedelta(hours=24))
+    
+    latest_time = machine_data['StrokeStartTime'].max()
+    historical_data = machine_data[machine_data['StrokeStartTime'] >= (latest_time - time_delta)]
+
+    thresholds = {
+        'metal_temperature': {'min': 710, 'max': 730},
+        'top_die_temperature': {'min': 300, 'max': 380},
+        'solidification_time': {'min': 180, 'max': 180},
+        'tilting_angle': {'min': 90, 'max': 90},
+        'tilting_speed': {'min': 6, 'max': 8},
+    }
+    param_thresholds = thresholds.get(parameter)
+
+    formatted_historical = []
+    if not historical_data.empty and parameter in historical_data.columns:
+        for _, row in historical_data.iterrows():
+            value = row[parameter]
+            is_violation = False
+            if param_thresholds and (value < param_thresholds['min'] or value > param_thresholds['max']):
+                is_violation = True
+            
+            data_point = {
+                "time": row['StrokeStartTime'].strftime("%H:%M"),
+                parameter: round(float(value), 2),
+                "is_violation": is_violation,
+                "type": "historical"
+            }
+            formatted_historical.append(data_point)
+
+    steps_map = {'1hr': 12, '6hr': 72, '24hr': 288}
+    steps = steps_map.get(time_range, 12)
     predictions, timestamps = predictor.predict_future(steps)
     
-    if predictions is None:
-        return jsonify({"success": False, "message": timestamps}), 400
-    
     formatted_predictions = []
-    for i, timestamp in enumerate(timestamps):
-        p_dict = {"time": timestamp}
-        for j, feature in enumerate(predictor.feature_columns):
-            p_dict[feature] = round(float(predictions[i][j]), 2)
-        formatted_predictions.append(p_dict)
-        
+    if predictions is not None:
+        for i, timestamp in enumerate(timestamps):
+            p_dict = {"time": timestamp, "type": "predicted", "is_violation": False}
+            for j, feature in enumerate(predictor.feature_columns):
+                p_dict[feature] = round(float(predictions[i][j]), 2)
+            formatted_predictions.append(p_dict)
+
     return jsonify({
         "success": True,
-        "predictions": formatted_predictions,
+        "data": formatted_historical + formatted_predictions,
         "feature_columns": predictor.feature_columns
     })
 
@@ -348,7 +411,7 @@ def get_machines():
     try:
         _, df = predictor.load_and_preprocess_data()
         if df is None:
-            return jsonify({"success": False, "message": "Could not load data to find machines. The file might be missing required columns."}), 400
+            return jsonify({"success": False, "code": "NO_DATA_FILE", "message": "Could not load data. Please upload a data file."}), 404
             
         machines = df["MachineName"].unique().tolist()
         return jsonify({"success": True, "machines": machines})
@@ -357,44 +420,66 @@ def get_machines():
 
 @app.route('/api/alerts', methods=['GET'])
 def get_alerts():
-    """Generates real-time alerts by checking the latest data against thresholds."""
+    """
+    Generates alerts by scanning the entire dataset for any threshold violations.
+    """
     try:
         df_selected, _ = predictor.load_and_preprocess_data()
-        if df_selected is None:
-            return jsonify({"success": False, "message": "Could not load data to generate alerts."}), 400
-        
+        if df_selected is None or 'StrokeStartTime' not in df_selected.columns:
+            return jsonify({"success": True, "alerts": []})
+
         alerts = []
         alert_id_counter = 1
         thresholds = {
-            'metal_temperature': {'min': 675, 'max': 755},
-            'top_die_temperature': {'min': 270, 'max': 370},
-            'solidification_time': {'min': 30, 'max': 60}
+            'metal_temperature': {'min': 710, 'max': 730, 'label': 'Metal Temperature'},
+            'top_die_temperature': {'min': 300, 'max': 380, 'label': 'Top Die Temperature'},
+            'solidification_time': {'min': 180, 'max': 180, 'label': 'Solidification Time'},
+            'tilting_angle': {'min': 90, 'max': 90, 'label': 'Tilting Angle'},
+            'tilting_speed': {'min': 6, 'max': 8, 'label': 'Tilting Speed'},
         }
         
-        latest_data_per_machine = df_selected.loc[df_selected.groupby('MachineName')['StrokeNumber'].idxmax()]
-        
-        for _, row in latest_data_per_machine.iterrows():
+        df_sorted = df_selected.sort_values(by='StrokeStartTime', ascending=False)
+
+        for _, row in df_sorted.iterrows():
             machine_name = row['MachineName']
-            for param, limits in thresholds.items():
-                if param in row and pd.notna(row[param]):
-                    value = row[param]
-                    if value < limits['min'] or value > limits['max']:
+            for param_key, limits in thresholds.items():
+                if param_key in row and pd.notna(row[param_key]):
+                    value = row[param_key]
+                    
+                    # For single-value thresholds, check for exact match is not useful, check for deviation
+                    is_violation = False
+                    if limits['min'] == limits['max']:
+                        if value != limits['min']:
+                             is_violation = True
+                    elif value < limits['min'] or value > limits['max']:
+                        is_violation = True
+
+                    if is_violation:
                         alerts.append({
-                            "id": alert_id_counter,
+                            "id": f"alert-{alert_id_counter}",
                             "machine": machine_name,
-                            "parameter": param.replace('_', ' ').title(),
+                            "parameter": limits['label'],
                             "value": round(value, 2),
                             "threshold": f"{limits['min']} - {limits['max']}",
-                            "severity": "high" if value < limits['min'] * 0.95 or value > limits['max'] * 1.05 else "medium",
-                            "time": datetime.now().strftime("%H:%M")
+                            "severity": "high",
+                            "time": row['StrokeStartTime'].strftime("%Y-%m-%d %H:%M") if pd.notna(row['StrokeStartTime']) else "N/A"
                         })
                         alert_id_counter += 1
         
-        return jsonify({"success": True, "alerts": alerts})
+        MAX_ALERTS = 50 
+        return jsonify({"success": True, "alerts": alerts[:MAX_ALERTS]})
     except Exception as e:
         traceback.print_exc()
         return jsonify({"success": False, "message": f"Alerts error: {str(e)}"}), 500
 
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve(path):
+    if path != "" and os.path.exists("../frontend/build/" + path):
+        return send_from_directory('../frontend/build', path)
+    else:
+        return send_from_directory('../frontend/build', 'index.html') 
+    
 # --- Main Execution ---
 if __name__ == '__main__':
     if os.path.exists(predictor.current_data_file):
@@ -404,4 +489,4 @@ if __name__ == '__main__':
     else:
         print(f"Default file '{predictor.current_data_file}' not found. Upload a file to train the model.")
     
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000, debug=True)
